@@ -1,115 +1,85 @@
 import paddle
-from paddle.io import Dataset, DataLoader, BatchSampler, DistributedBatchSampler
-import numpy as np
-import os
-import time
-from datetime import date
-from tqdm import tqdm
-import pdb
 import paddle.nn as nn
 import paddle.nn.functional as F
 
-class CustomContrastiveLoss(nn.Layer):
-    def __init__(self):
-        super(CustomContrastiveLoss, self).__init__()
+class TwoTowerModel(nn.Layer):
+    def __init__(self,
+                 ad_emb_table: paddle.Tensor,
+                 pad_idx: int = 0,
+                 hidden_size: int = 1024):
+        """
+        ad_emb_table: [num_embs, D]，numpy→tensor 后传进来
+        pad_idx:      用于序列 padding 的 index（对应 embedding 全 0）
+        hidden_size:  GRU 隐藏维度(D)
+        """
+        super().__init__()
+        num_embs, emb_dim = ad_emb_table.shape
 
-    def forward(self, logits, labels, pad_mask, ad_idxs):
-        batch_size, seq_len, dim = logits.shape
-        logits_flatten = paddle.reshape(logits,[batch_size * seq_len,dim])
-        labels_flatten = paddle.reshape(labels,[batch_size * seq_len,dim])
-        pad_mask = paddle.reshape(pad_mask,[batch_size * seq_len])
-        ad_idxs = paddle.reshape(ad_idxs,[batch_size * seq_len])
-        
-        # 计算相似度矩阵
-        similarity_matrix = paddle.matmul(logits_flatten, labels_flatten, transpose_y=True)
-        # mask
-        mask = paddle.zeros(shape=[batch_size * seq_len,batch_size * seq_len],dtype='float32')
-        mask = paddle.where(pad_mask == 0,mask,paddle.to_tensor(1.0,dtype='float32')) # 纵行
-        mask = paddle.where(paddle.expand(pad_mask.unsqueeze(-1),shape=[batch_size * seq_len,batch_size * seq_len]) == 0,paddle.to_tensor(0.0,dtype='float32'),paddle.to_tensor(1.0,dtype='float32')) # 横行
-        similarity_matrix = similarity_matrix * mask
-        sf = paddle.nn.Softmax()
-        similarity_matrix = sf(similarity_matrix)
-        # loss
-        label = (ad_idxs.unsqueeze(0) == ad_idxs.unsqueeze(-1))
-        label = paddle.where(label,paddle.to_tensor(1.0,dtype='float32'),paddle.to_tensor(0.0,dtype='float32'))
-        label = paddle.where(mask == 0,paddle.to_tensor(0.0,dtype='float32'),label)
-        loss = paddle.where(label==paddle.to_tensor(1.0,dtype='float32'),-paddle.log2(similarity_matrix),paddle.to_tensor(0.0,dtype='float32'))
-        loss_sum = paddle.sum(loss,axis=-1)
-        # 返回平均损失
-        return loss_sum.mean()
+        # 1) Embedding 层，用来把 [B,T] → [B,T,D]，PAD 自动映成全 0
+        self.embed = nn.Embedding(
+            num_embeddings = num_embs,
+            embedding_dim   = emb_dim,
+            padding_idx     = pad_idx)
+        self.embed.weight.set_value(ad_emb_table)
+        self.embed.weight.stop_gradient = True   # 冻结它
 
-class PointWiseFeedForward(paddle.nn.Layer):
-    def __init__(self, hidden_units, dropout_rate):
-        super(PointWiseFeedForward, self).__init__()
+        # 2) 序列编码器：GRU
+        self.encoder = nn.GRU(input_size=emb_dim,
+                              hidden_size=hidden_size,
+                              direction='forward')
 
-        self.conv1 = paddle.nn.Conv1D(in_channels=hidden_units, out_channels=hidden_units, kernel_size=1)
-        self.dropout1 = paddle.nn.Dropout(dropout_rate)
-        self.relu = paddle.nn.ReLU()
-        self.conv2 = paddle.nn.Conv1D(in_channels=hidden_units, out_channels=hidden_units, kernel_size=1)
-        self.dropout2 = paddle.nn.Dropout(dropout_rate)
+    def forward(self, input_ids):
+        """
+        正常前向，只输出 user_vec，用于召回/在线向量化
+        input_ids: [B, T] int64
+        return: user_vec [B, hidden_size]
+        """
+        x, _ = self.embed(input_ids), None   # [B,T,D]
+        _, h_n = self.encoder(x)             # h_n: [1, B, D]
+        user_vec = h_n.squeeze(0)            # [B, D]
+        return user_vec
 
-    def forward(self, inputs):
-        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose([0, 2, 1]))))))
-        outputs = outputs.transpose([0, 2, 1])  # as Conv1D requires (N, C, Length)
-        outputs += inputs
-        return outputs
+    def nce_loss(self, user_vec, pos_idx, neg_k=100):
+        """
+        负采样 NCE 损失
+        user_vec: [B, D]
+        pos_idx:  [B]     正样本广告下标
+        neg_k:    每个正例采样多少负例
+        returns:  loss, logits_sampled
+        """
+        B, D = user_vec.shape
+        # 1) 采负样本
+        #   uniform 采样 [0, num_embs)—包含 pad_idx(0) 也可能被当负样本
+        neg_idx = paddle.randint(
+            low=0, high=self.embed._num_embeddings,
+            shape=[B, neg_k], dtype='int64')
 
-class SASRec(paddle.nn.Layer):
-    def __init__(self, args):
-        super(SASRec, self).__init__()
-        self.dev = args.device
-        self.pos_emb = paddle.nn.Embedding(num_embeddings=args.maxlen+1, embedding_dim=args.hidden_units, padding_idx=0)
-        self.emb_dropout = paddle.nn.Dropout(p=args.dropout_rate)
+        # 2) 拼正负
+        pos_idx = pos_idx.unsqueeze(1)            # [B,1]
+        all_idx = paddle.concat([pos_idx, neg_idx], axis=1)  # [B,1+K]
 
-        self.attention_layernorms = paddle.nn.LayerList()  # to be Q for self-attention
-        self.attention_layers = paddle.nn.LayerList()
-        self.forward_layernorms = paddle.nn.LayerList()
-        self.forward_layers = paddle.nn.LayerList()
+        # 3) 拿到它们的 embedding
+        #    [B,1+K,D]
+        cand_emb = self.embed(all_idx)
 
-        self.last_layernorm = paddle.nn.LayerNorm(normalized_shape=args.hidden_units, epsilon=1e-8)
+        # 4) 计算点积得分
+        #    expand user_vec → [B,1+K,D]
+        u = user_vec.unsqueeze(1).expand_as(cand_emb)
+        logits = paddle.sum(u * cand_emb, axis=-1)  # [B,1+K]
 
-        for _ in range(args.num_blocks):
-            new_attn_layernorm = paddle.nn.LayerNorm(normalized_shape=args.hidden_units, epsilon=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
+        # 5) 构造标签：正样本都在位置 0
+        labels = paddle.zeros([B], dtype='int64')
 
-            new_attn_layer = paddle.nn.MultiHeadAttention(embed_dim=args.hidden_units, num_heads=args.num_heads, dropout=args.dropout_rate)
-            self.attention_layers.append(new_attn_layer)
+        # 6) 交叉熵
+        loss = F.cross_entropy(logits, labels)
+        return loss, logits
 
-            new_fwd_layernorm = paddle.nn.LayerNorm(normalized_shape=args.hidden_units, epsilon=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
+    @paddle.no_grad()
+    def recall(self, user_vec, K=100):
+        """两塔召回：full-dot + topk"""
+        all_emb = self.embed.weight        # [N, D]
+        scores = paddle.matmul(user_vec, all_emb.t())  # [B, N]
+        topk_scores, topk_idx = paddle.topk(scores, k=K, axis=1)
+        return topk_idx, topk_scores
 
-            new_fwd_layer = PointWiseFeedForward(hidden_units=args.hidden_units, dropout_rate=args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
-
-    def log2feats(self, seqs , mask): 
-        pos = paddle.to_tensor(np.tile(np.arange(1, seqs.shape[1] + 1), [seqs.shape[0], 1]),dtype='float32').cuda()
-        pos *= mask
-        seqs += self.pos_emb(paddle.to_tensor(pos, dtype='int64').cuda())
-        seqs = self.emb_dropout(seqs)
-
-        tl = seqs.shape[1]  # time dim len for enforce causality
-        attention_mask = ~paddle.tril(paddle.ones((tl, tl), dtype='bool'), diagonal=0)
-
-        for i in range(len(self.attention_layers)):
-            Q = self.attention_layernorms[i](seqs)
-            mha_outputs = self.attention_layers[i](Q, seqs, seqs, attn_mask=attention_mask)
-            seqs = Q + mha_outputs
-
-            seqs = self.forward_layernorms[i](seqs)
-            seqs = self.forward_layers[i](seqs)
-
-        log_feats = self.last_layernorm(seqs)  # (U, T, C) -> (U, -1, C)
-
-        return log_feats
-
-    def forward(self,seqs, mask, pos_seqs, neg_seqs):  # for training        
-        logits = self.log2feats(seqs,mask)  
-        return logits  # B * S * D
-
-    def predict(self, seqs, mask, item_embs):  # for inference
-        log_feats = self.log2feats(seqs,mask)  
-
-        final_feat = log_feats[:, -1, :]  
-
-        logits = paddle.matmul(final_feat,item_embs,transpose_y=True)
-        return logits  # preds  # (U, I)
+    # rerank 方法同以前，不再赘述

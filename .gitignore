@@ -1,3 +1,6 @@
 __pycache__
 checkpoint
 data
+*gpt*
+*.txt
+*.pkl

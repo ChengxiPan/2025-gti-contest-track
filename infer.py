@@ -1,90 +1,70 @@
 import paddle
-from paddle.io import Dataset, DataLoader, BatchSampler, DistributedBatchSampler
 import numpy as np
-import os
-import time
-from datetime import date
 from tqdm import tqdm
-from utils import *
-from model import *
-import sys
-sys.stdout.reconfigure(encoding='utf-8')
-import argparse
+from model import TwoTowerModel
+import os
+import pickle
 
-# 配置文件
-class Args():
-    def __init__(self):
-        self.dataset_dir = "data/data323258/w_data" # root directory containing the datasets
-        self.unitid_file = "unitid.txt"
-        self.train_file = "1w_train.txt"
-        self.test_file = "test.txt"
-        self.test_gt_file = "test_gt.txt"
-        self.batch_size = 32
-        self.lr = 0.0001
-        self.maxlen = 200
-        self.hidden_units = 1024
-        self.emb_dim = 1024
-        self.num_blocks = 2
-        self.num_epochs = 3
-        self.num_heads = 1
-        self.dropout_rate = 0.2
-        self.device = "gpu"
-        self.inference_only = True
-        self.state_dict_path = "checkpoint/SASRec.epoch=3.lr=0.0001.layer=2.head=1.hidden=1024.maxlen=200.pth"
+checkpoint_dir = 'checkpoint'
+if not os.path.exists(checkpoint_dir):
+    os.makedirs(checkpoint_dir)
 
-args = Args()
-parser = argparse.ArgumentParser(description="This is a description of the script.")
-parser.add_argument("--dataset_dir", type=str, help="数据集路径")
-parser.add_argument("--output_path", type=str, help="输出结果路径")
-args_2 = parser.parse_args()
-args.dataset_dir = args_2.dataset_dir
+model_path = os.path.join(checkpoint_dir, 'two_tower_model.pdparams')
 
-with open(os.path.join(args.dataset_dir, 'args.txt'), 'w') as f:
-    f.write('\n'.join([str(k) + ',' + str(v) for k, v in sorted(vars(args).items(), key=lambda x: x[0])]))
-f.close()
 
-def infer(model):
-    print("开始加载测试数据...")
-    dataset = TestDataset(args)
-    dataloader =  paddle.io.DataLoader(dataset, batch_size=args.batch_size,collate_fn=dataset.collate_fn)
-    print("数据加载完成")
-    # 全库embedding
-    item_embs = paddle.to_tensor([v["embedding"] for k,v in dataset.unitid_data.items()]) 
-    id2item = dict(zip([i for i in range(dataset.lenth_unit_data)],list(dataset.unitid_data.keys())))
-    sf = paddle.nn.Softmax()
-    with paddle.no_grad():
-        with open(args_2.output_path,"w") as f:
-            for user_ids,padded_embeddings, pad_mask in tqdm(dataloader):
-                logits = model.predict(padded_embeddings,pad_mask,item_embs) # 全库检索
-                probs = sf(logits)
-                topk_values, topk_indices = paddle.topk(probs, k=10, axis=-1)
-                for idx in range(topk_indices.shape[0]):
-                    items = []
-                    for jdx in range(topk_indices.shape[1]):
-                        items.append(id2item[int(topk_indices[idx,jdx])]) # 全库检索
-                    temp = [dataset.id2u[int(user_ids[idx])]," ".join([str(i) for i in items])]
-                    f.write("\t".join(temp))
-                    f.write("\n")
-        print("Done")
+# === 加载 mapper ===
+with open("saved_mapper.pkl", "rb") as f:
+    mapper = pickle.load(f)
+num_ads = len(mapper)
 
-model = SASRec(args).to(args.device) 
-
-# 定义一个 XavierNormal 初始化器
-xavier_normal_init = paddle.nn.initializer.XavierNormal()
-
-for name, param in model.named_parameters():
-    try:
-        xavier_normal_init(param, param.block)
-    except:
-        print(f"{name} xaiver 初始化失败")
-        pass  # 忽略初始化失败的层
-
-epoch_start_idx = 1
-if args.state_dict_path is not None:
-    try:
-        model.set_dict(paddle.load(args.state_dict_path))
-    except:  
-        print('failed loading state_dicts, pls check file path: ')
-        
+# === 加载模型 ===
+model = TwoTowerModel(hidden_size=1024, num_ads=num_ads)
+model.set_state_dict(paddle.load(model_path))
 model.eval()
-infer(model)
+
+
+# === 推理逻辑 ===
+sample_submission_path = 'sample_submission.txt'
+read_path = 'data/sequence_data'
+
+results = []
+
+with open(read_path, 'r') as f:
+    for line in tqdm(f, desc="Predicting"):
+        user_id, ad_seq = line.strip().split('\t')
+        ad_ids = ad_seq.strip().split()
+
+        if not ad_ids:
+            continue
+
+        # 只使用最后 max_len 个（模型训练时也有限长序列）
+        max_len = 20
+        input_ids = ad_ids[-max_len:]
+
+        # === embedding lookup 并 padding ===
+        input_embs = []
+        for aid in input_ids:
+            emb = mapper.get_embedding(aid)
+            if emb is not None:
+                input_embs.append(emb)
+
+        if not input_embs:
+            continue  # 跳过无法映射的用户
+
+        pad_len = max_len - len(input_embs)
+        input_embs = [mapper.pad_emb] * pad_len + input_embs  # padding to left
+        input_array = np.stack(input_embs)[np.newaxis, :]     # [1, T, D]
+
+        input_tensor = paddle.to_tensor(input_array, dtype='float32')  # [1, T, D]
+
+        # === 模型预测 ===
+        with paddle.no_grad():
+            output = model(input_tensor, paddle.to_tensor(mapper.get_all_embeddings()))  # [1, num_ads]
+            prediction_idx = paddle.argmax(output, axis=1).numpy()[0]
+            prediction_ad_id = mapper.index2id[prediction_idx]
+
+        results.append(f"{user_id}\t{prediction_ad_id}")
+
+# === 写入预测结果 ===
+with open(sample_submission_path, 'w') as out_file:
+    out_file.write('\n'.join(results))

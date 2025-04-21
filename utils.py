@@ -1,91 +1,145 @@
-from paddle.io import Dataset, DataLoader
 import numpy as np
-import os
+import random
+from paddle.io import Dataset
 from tqdm import tqdm
+import pickle
+import paddle
+from paddle.io import DataLoader
 
-class AdsDataset(Dataset):
-    def __init__(self, ad_data_path, sequence_data_path, max_seq_len=20, use_emb=True):
-        super(AdsDataset, self).__init__()
-        self.max_seq_len = max_seq_len
-        self.use_emb = use_emb
-
-        # load ad data: 
-        ## ad_id -> content list and ad_id -> embedding
-        ### key: ad_id, value: content list or embedding
-        self.ad_content, self.ad_emb = self._load_ad_data(ad_data_path)
-
-        # load sequence data:
-        ## user_id -> ad sequence
-        ### [(ad_sequence_ids, target_ad_id), ...]
-        self.samples = self._load_sequence_data(sequence_data_path)
-
-    def _load_ad_data(self, ad_data_path):
-        ad_content = {}  # ad_id -> content list
-        ad_emb = {}      # ad_id -> np.array
+class AdEmbeddingMapper:
+    """
+    负责
+    1) 加载 ad_id -> emb 映射
+    2) 构造 ad_id -> index (1…N)，0 留给 PAD
+    3) 输出 embedding table [N+1, D]，index=0 对应全 0 向量
+    """
+    def __init__(self, ad_data_path):
+        self.ad_emb = {}
         with open(ad_data_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f):
+            for line in tqdm(f, desc="Loading ad embeddings"):
                 parts = line.strip().split('\t')
-                if len(parts) != 3:
-                    continue  # skip invalid lines
-                ad_id, content_str, emb_str = parts
-                ad_id = ad_id.strip() # exg: 123456
-                content = list(map(int, content_str.split(','))) # exg: [1, 2, 3, 4]
-                emb = np.array(list(map(float, emb_str.split(','))), dtype=np.float32) # exg: [0.1, 0.2, 0.3, 0.4]
-                ad_content[ad_id] = content
-                ad_emb[ad_id] = emb
-        return ad_content, ad_emb
+                if len(parts)!=3: continue
+                aid, _, emb_str = parts
+                emb = np.array(list(map(float, emb_str.split(','))), dtype=np.float32)
+                self.ad_emb[aid] = emb
+        # 建 index，从1开始
+        self.id2idx = {}
+        self.idx2id = {}
+        for i, aid in enumerate(self.ad_emb.keys(), start=1):
+            self.id2idx[aid] = i
+            self.idx2id[i] = aid
+        self.pad_idx = 0
+        self.emb_dim = next(iter(self.ad_emb.values())).shape[0]
 
-    def _load_sequence_data(self, sequence_data_path):
-        samples = []
+    def __len__(self):
+        return len(self.ad_emb) + 1  # 多一个 pad
+
+    def get_emb_table(self):
+        N = len(self.ad_emb)
+        table = np.zeros((N+1, self.emb_dim), dtype=np.float32)
+        for aid, idx in self.id2idx.items():
+            table[idx] = self.ad_emb[aid]
+        return table
+
+class AdSequenceDataset(Dataset):
+    """
+    每个样本返回：
+      input_seq: List[int]  (每个 int 是在 mapper.id2idx 中的 index)
+      target:    int
+    """
+    def __init__(self,
+                 sequence_data_path,
+                 mapper: AdEmbeddingMapper,
+                 max_seq_len=20,
+                 max_samples_per_user=10):
+        super().__init__()
+        self.samples = []
+        self.mapper = mapper
+        self.max_seq = max_seq_len
+        self.max_samp = max_samples_per_user
+
         with open(sequence_data_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                user_id, ad_seq = line.strip().split('\t')
-                ad_ids = ad_seq.strip().split()
-                if len(ad_ids) < 2:
-                    continue
+            for line in tqdm(f, desc="Loading sequences"):
+                user, seq = line.strip().split('\t')
+                ad_ids = seq.split()
+                # 截断
+                if len(ad_ids) > self.max_seq+1:
+                    ad_ids = ad_ids[-(self.max_seq+1):]
+                # 拆成多对 (input, target)
+                cand = []
                 for i in range(1, len(ad_ids)):
-                    input_seq = ad_ids[max(0, i - self.max_seq_len):i] # take the last max_seq_len elements
-                    target = ad_ids[i] # the next ad to predict
-                    samples.append((input_seq, target)) # append the input sequence and target
-        return samples
+                    inp = []
+                    for aid in ad_ids[:i]:
+                        idx = self.mapper.id2idx.get(aid)
+                        if idx is not None:
+                            inp.append(idx)
+                    tgt = self.mapper.id2idx.get(ad_ids[i], None)
+                    if inp and tgt is not None:
+                        cand.append((inp, tgt))
+                if len(cand)>self.max_samp:
+                    cand = random.sample(cand, self.max_samp)
+                self.samples.extend(cand)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        input_ids, target_id = self.samples[idx]
+        return self.samples[idx]
 
-        if self.use_emb:
-            input_embs = [self.ad_emb[aid] for aid in input_ids if aid in self.ad_emb]
-            target_emb = self.ad_emb[target_id]
-            # padding
-            pad_len = self.max_seq_len - len(input_embs)
-            if pad_len > 0:
-                pad_emb = np.zeros_like(target_emb)
-                input_embs = [pad_emb] * pad_len + input_embs
-            input_tensor = np.stack(input_embs)
-            return input_tensor, target_emb
-        else:
-            # 输入是 ad content ids（tokens）
-            input_tokens = [self.ad_content[aid] for aid in input_ids if aid in self.ad_content]
-            target_tokens = self.ad_content[target_id]
-            # padding
-            pad_token = [0]
-            input_tokens = [[0]*10]*(self.max_seq_len - len(input_tokens)) + input_tokens
-            return input_tokens, target_tokens
+def collate_fn(batch):
+    """
+    batch: List of (List[int], int)
+    返回：
+      input_ids: [B, T]  int64，前 pad 到 max T
+      mask:      [B, T]  int64，0=pad,1=real
+      target:    [B]     int64
+    """
+    seqs, tgts = zip(*batch)
+    B = len(seqs)
+    maxL = max(len(s) for s in seqs)
+    padded = []
+    masks  = []
+    for s in seqs:
+        padlen = maxL - len(s)
+        padded.append([0]*padlen + s)
+        masks.append([0]*padlen + [1]*len(s))
+    return (paddle.to_tensor(padded, dtype='int64'),
+            paddle.to_tensor(masks,  dtype='float32'),
+            paddle.to_tensor(tgts,   dtype='int64'))
 
 
+    
 if __name__ == "__main__":
-    dataset = AdsDataset(
-    ad_data_path="./data/ad_data",
-    sequence_data_path="./data/sequence_data",
-    max_seq_len=10,
-    use_emb=True  # or False for token mode
-)
+    ad_data_path = 'data/ad_data'
+    sequence_data_path = 'data/sequence_data'
+    
+    # 1) 准备 Mapper + Dataset + Dataloader
+    mapper = AdEmbeddingMapper('data/ad_data')
+    emb_table = mapper.get_emb_table()  # numpy [N+1, D]
+    emb_tensor = paddle.to_tensor(emb_table, dtype='float32')
 
-    # dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-    # for batch in dataloader:
-    #     x, y = batch
-    #     print(x.shape, y.shape)
-    #     break
+    ds = AdSequenceDataset('data/sequence_data', mapper, max_seq_len=20)
+    dl = DataLoader(ds, batch_size=256, shuffle=True, drop_last=True,
+                    collate_fn=collate_fn)
+    
+    # 2) 将数据集保存到文件
+    with open("saved_ds.pkl", "wb") as f:
+        pickle.dump(ds, f)
+    with open("saved_mapper.pkl", "wb") as f:
+        pickle.dump(mapper, f)
+        
+    # 3) 从文件中加载数据集
+    with open("saved_ds.pkl", "rb") as f:
+        loaded_ds = pickle.load(f)
+    with open("saved_mapper.pkl", "rb") as f:
+        loaded_mapper = pickle.load(f)
+    
+    dl = DataLoader(loaded_ds, batch_size=256, shuffle=True, drop_last=True,
+                    collate_fn=collate_fn)
+    
+    for batch in dl:
+        input_ids, mask, target = batch
+        print("Input IDs:", input_ids)
+        print("Mask:", mask)
+        print("Target:", target)
+        break
